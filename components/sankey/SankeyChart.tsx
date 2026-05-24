@@ -2,7 +2,12 @@
 
 import { useEffect, useRef } from "react"
 import { tooltipFormatter } from "@/lib/client-tooltip"
-interface SankeyData { nodes: unknown[]; links: unknown[] }
+
+interface SankeyData {
+  nodes: unknown[]
+  links: unknown[]
+  yearColumns?: number[]
+}
 
 interface Props {
   data: SankeyData | null
@@ -57,13 +62,20 @@ export default function SankeyChart({ data }: Props) {
           data: data.nodes,
           links: data.links,
           emphasis: { focus: "adjacency" },
-          nodeAlign: "left",
+          // nodeAlign: "left" is default and works with depth
           layoutIterations: 32,
-          label: { show: true, position: "right", fontSize: 12, color: "inherit" },
-          lineStyle: { color: "gradient", opacity: 0.4 },
-          itemStyle: { borderRadius: 4 },
-          nodeWidth: 16,
-          nodeGap: 12,
+          nodeWidth: 14,
+          nodeGap: 10,
+          // Strip " · YYYY" from displayed node labels
+          label: {
+            show: true,
+            position: "right",
+            fontSize: 12,
+            color: "inherit",
+            formatter: (params: { name: string }) => params.name.replace(/ · \d{4}$/, ""),
+          },
+          lineStyle: { color: "gradient", opacity: 0.45 },
+          itemStyle: { borderRadius: 3 },
         }],
       }, true)
     }
@@ -84,5 +96,5 @@ export default function SankeyChart({ data }: Props) {
     }
   }, [])
 
-  return <div ref={containerRef} className="w-full h-full min-h-[500px]" />
+  return <div ref={containerRef} className="w-full h-full" />
 }

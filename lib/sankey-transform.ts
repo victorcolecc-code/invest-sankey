@@ -5,8 +5,9 @@ export type SankeyMode = "flat" | "yearly"
 
 export interface SankeyNode {
   name: string
+  depth?: number          // ECharts column index — enforces time-axis ordering
   itemStyle?: { color: string }
-  // custom tooltip fields
+  // tooltip fields (passed through by ECharts to formatter)
   _accountId: number
   _accountType: string
   _totalInvested: number
@@ -21,8 +22,6 @@ export interface SankeyLink {
   source: string
   target: string
   value: number
-  lineStyle?: { color: string }
-  // custom tooltip fields
   _date: string
   _note: string | null
   _transactionCount: number
@@ -31,6 +30,7 @@ export interface SankeyLink {
 export interface SankeyData {
   nodes: SankeyNode[]
   links: SankeyLink[]
+  yearColumns: number[]   // sorted years present in data; empty in flat mode
 }
 
 const ACCOUNT_TYPE_LABELS: Record<string, string> = {
@@ -57,12 +57,17 @@ export function buildSankeyData(
 
   // Filter transactions by year range
   const filtered = transactions.filter((t) => {
-    if (!yearFrom && !yearTo) return true
     const year = parseInt(t.date.slice(0, 4), 10)
     if (yearFrom && year < yearFrom) return false
     if (yearTo && year > yearTo) return false
     return true
   })
+
+  // Build year → depth mapping (0-indexed by sorted year)
+  const yearsSet = new Set<number>()
+  for (const t of filtered) yearsSet.add(parseInt(t.date.slice(0, 4), 10))
+  const yearColumns = Array.from(yearsSet).sort()
+  const yearToDepth = new Map(yearColumns.map((y, i) => [y, i]))
 
   // Group positions by accountId
   const positionsByAccount = new Map<number, Position[]>()
@@ -72,7 +77,7 @@ export function buildSankeyData(
     positionsByAccount.set(p.accountId, list)
   }
 
-  // Collect node keys that appear in filtered transactions
+  // Collect node keys: "accountId:year" in yearly mode, "accountId:" in flat mode
   const nodeKeys = new Set<string>()
   for (const t of filtered) {
     const from = accountMap.get(t.fromAccountId)
@@ -98,14 +103,15 @@ export function buildSankeyData(
     const earliestStart = acctPositions.length > 0
       ? acctPositions.reduce((min, p) => p.startDate < min ? p.startDate : min, acctPositions[0].startDate)
       : null
-
     const annReturn = earliestStart && totalInitial > 0
       ? annualizedReturn(totalCurrent, totalInitial, earliestStart)
       : null
 
-    const name = nodeName(account, year)
+    const depth = (mode === "yearly" && year != null) ? yearToDepth.get(year) : undefined
+
     nodeByKey.set(key, {
-      name,
+      name: nodeName(account, year),
+      depth,
       itemStyle: { color: account.color },
       _accountId: accountId,
       _accountType: ACCOUNT_TYPE_LABELS[account.type] ?? account.type,
@@ -123,7 +129,7 @@ export function buildSankeyData(
     })
   }
 
-  // Build links (aggregate same source+target pairs)
+  // Build links — aggregate same source+target pairs
   const linkMap = new Map<string, { total: number; dates: string[]; notes: string[] }>()
   for (const t of filtered) {
     const from = accountMap.get(t.fromAccountId)
@@ -157,6 +163,7 @@ export function buildSankeyData(
   return {
     nodes: Array.from(nodeByKey.values()),
     links,
+    yearColumns: mode === "yearly" ? yearColumns : [],
   }
 }
 
@@ -171,9 +178,11 @@ export function tooltipHtml(params: {
     const invested = node._totalInvested
     const current = node._currentValue
     const rate = node._annualizedReturn
+    // Strip " · YYYY" suffix for cleaner tooltip title
+    const displayName = (node.name as string).replace(/ · \d{4}$/, "")
 
     let html = `<div class="sankey-tooltip">
-      <strong>${node.name}</strong>
+      <strong>${displayName}</strong>
       <div class="row"><span>账户类型</span><span>${node._accountType}</span></div>`
 
     if (node._positions.length > 0) {
@@ -190,18 +199,18 @@ export function tooltipHtml(params: {
         html += `<div class="row"><span>年化收益</span><span class="${cls}">${formatPercent(rate)}</span></div>`
       }
     }
-
     html += `</div>`
     return html
   }
 
-  // link
   const link = d as unknown as SankeyLink
+  const srcDisplay = (link.source as string).replace(/ · \d{4}$/, "")
+  const tgtDisplay = (link.target as string).replace(/ · \d{4}$/, "")
   return `<div class="sankey-tooltip">
-    <strong>${link.source} → ${link.target}</strong>
-    <div class="row"><span>转入金额</span><span>${formatCNY(link.value as number)}</span></div>
+    <strong>${srcDisplay} → ${tgtDisplay}</strong>
+    <div class="row"><span>金额</span><span>${formatCNY(link.value as number)}</span></div>
     <div class="row"><span>时间</span><span>${link._date}</span></div>
-    ${link._transactionCount > 1 ? `<div class="row"><span>笔数</span><span>${link._transactionCount} 笔</span></div>` : ""}
-    ${link._note ? `<div class="row"><span>备注</span><span>${link._note}</span></div>` : ""}
+    ${(link._transactionCount as number) > 1 ? `<div class="row"><span>笔数</span><span>${link._transactionCount as number} 笔</span></div>` : ""}
+    ${link._note ? `<div class="row"><span>备注</span><span>${link._note as string}</span></div>` : ""}
   </div>`
 }

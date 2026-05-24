@@ -25,8 +25,9 @@ export function tooltipFormatter(params: { dataType: string; data: Record<string
     const startDate = d._startDate as string | null
     const rate = startDate && invested > 0 ? annualizedReturn(current, invested, startDate) : null
 
+    const displayName = (d.name as string).replace(/ · \d{4}$/, "")
     let html = `<div class="sankey-tooltip">
-      <strong>${d.name as string}</strong>
+      <strong>${displayName}</strong>
       <div class="row"><span>账户类型</span><span>${d._accountType as string}</span></div>`
 
     const posCount = (d._positions as unknown[])?.length ?? 0
@@ -49,9 +50,11 @@ export function tooltipFormatter(params: { dataType: string; data: Record<string
     return html
   }
 
-  // link
+  // link — strip year suffix from displayed names
+  const srcDisplay = (d.source as string).replace(/ · \d{4}$/, "")
+  const tgtDisplay = (d.target as string).replace(/ · \d{4}$/, "")
   return `<div class="sankey-tooltip">
-    <strong>${d.source as string} → ${d.target as string}</strong>
+    <strong>${srcDisplay} → ${tgtDisplay}</strong>
     <div class="row"><span>转入金额</span><span>${formatCNY(d.value as number)}</span></div>
     <div class="row"><span>时间</span><span>${d._date as string}</span></div>
     ${(d._transactionCount as number) > 1 ? `<div class="row"><span>笔数</span><span>${d._transactionCount as number} 笔</span></div>` : ""}
