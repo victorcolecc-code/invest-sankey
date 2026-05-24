@@ -1,15 +1,15 @@
-import type { Account, Transaction, Position } from "./db/schema"
+import type { Account, Position } from "./db/schema"
 import { annualizedReturn, formatPercent, formatCNY, formatDateRange } from "./finance"
 
 export type SankeyMode = "flat" | "yearly"
 
 export interface SankeyNode {
   name: string
-  depth?: number          // ECharts column index — enforces time-axis ordering
+  depth?: number
   itemStyle?: { color: string }
-  // tooltip fields (passed through by ECharts to formatter)
+  // tooltip fields
   _accountId: number
-  _accountType: string
+  _accountType: string          // "投资持仓" for position nodes, account type for account nodes
   _totalInvested: number
   _currentValue: number
   _startDate: string | null
@@ -30,7 +30,9 @@ export interface SankeyLink {
 export interface SankeyData {
   nodes: SankeyNode[]
   links: SankeyLink[]
-  yearColumns: number[]   // sorted years present in data; empty in flat mode
+  yearColumns: number[]      // sorted years present in data
+  yearLabelDepths: number[]  // depth index for each year's label column
+  totalDepths: number        // total number of depth columns
 }
 
 const ACCOUNT_TYPE_LABELS: Record<string, string> = {
@@ -41,13 +43,25 @@ const ACCOUNT_TYPE_LABELS: Record<string, string> = {
   other: "其他账户",
 }
 
-function nodeName(account: Account, year?: number): string {
-  return year != null ? `${account.name} · ${year}` : account.name
+// Blend hex color with white at ratio 0-1 (0 = original, 1 = white)
+function lightenHex(hex: string, ratio = 0.4): string {
+  const r = parseInt(hex.slice(1, 3), 16)
+  const g = parseInt(hex.slice(3, 5), 16)
+  const b = parseInt(hex.slice(5, 7), 16)
+  const lr = Math.round(r + (255 - r) * ratio)
+  const lg = Math.round(g + (255 - g) * ratio)
+  const lb = Math.round(b + (255 - b) * ratio)
+  return `#${lr.toString(16).padStart(2, "0")}${lg.toString(16).padStart(2, "0")}${lb.toString(16).padStart(2, "0")}`
 }
 
+/**
+ * Build Sankey from investment positions.
+ * Layout: account node (even depth) → investment node (odd depth)
+ * Yearly mode: year Y → account at depth 2*yearIdx, investment at depth 2*yearIdx+1
+ * Flat mode:   account at depth 0, investment at depth 1
+ */
 export function buildSankeyData(
   accounts: Account[],
-  transactions: Transaction[],
   positions: Position[],
   mode: SankeyMode,
   yearFrom?: number,
@@ -55,99 +69,132 @@ export function buildSankeyData(
 ): SankeyData {
   const accountMap = new Map(accounts.map((a) => [a.id, a]))
 
-  // Filter transactions by year range
-  const filtered = transactions.filter((t) => {
-    const year = parseInt(t.date.slice(0, 4), 10)
+  // Filter by year range using position startDate
+  const filtered = positions.filter((p) => {
+    const year = parseInt(p.startDate.slice(0, 4), 10)
     if (yearFrom && year < yearFrom) return false
     if (yearTo && year > yearTo) return false
     return true
   })
 
-  // Build year → depth mapping (0-indexed by sorted year)
+  // Sorted unique years present in filtered positions
   const yearsSet = new Set<number>()
-  for (const t of filtered) yearsSet.add(parseInt(t.date.slice(0, 4), 10))
+  for (const p of filtered) yearsSet.add(parseInt(p.startDate.slice(0, 4), 10))
   const yearColumns = Array.from(yearsSet).sort()
-  const yearToDepth = new Map(yearColumns.map((y, i) => [y, i]))
+  const yearToIdx = new Map(yearColumns.map((y, i) => [y, i]))
 
-  // Group positions by accountId
-  const positionsByAccount = new Map<number, Position[]>()
-  for (const p of positions) {
-    const list = positionsByAccount.get(p.accountId) ?? []
-    list.push(p)
-    positionsByAccount.set(p.accountId, list)
-  }
+  // Depth layout:
+  //   yearly:  account = yearIdx*2,  investment = yearIdx*2+1
+  //   flat:    account = 0,          investment = 1
+  const totalDepths = mode === "yearly" && yearColumns.length > 0
+    ? yearColumns.length * 2
+    : 2
+  const yearLabelDepths = yearColumns.map((_, i) => mode === "yearly" ? i * 2 : 0)
 
-  // Collect node keys: "accountId:year" in yearly mode, "accountId:" in flat mode
-  const nodeKeys = new Set<string>()
-  for (const t of filtered) {
-    const from = accountMap.get(t.fromAccountId)
-    const to = accountMap.get(t.toAccountId)
-    if (!from || !to) continue
-    const year = mode === "yearly" ? parseInt(t.date.slice(0, 4), 10) : undefined
-    nodeKeys.add(`${t.fromAccountId}:${year ?? ""}`)
-    nodeKeys.add(`${t.toAccountId}:${year ?? ""}`)
-  }
-
-  // Build nodes
   const nodeByKey = new Map<string, SankeyNode>()
-  for (const key of nodeKeys) {
-    const [idStr, yearStr] = key.split(":")
-    const accountId = parseInt(idStr, 10)
-    const year = yearStr ? parseInt(yearStr, 10) : undefined
-    const account = accountMap.get(accountId)
+  const linkMap = new Map<string, { total: number; dates: string[] }>()
+
+  for (const pos of filtered) {
+    const account = accountMap.get(pos.accountId)
     if (!account) continue
+    const year = parseInt(pos.startDate.slice(0, 4), 10)
+    const yearIdx = mode === "yearly" ? (yearToIdx.get(year) ?? 0) : 0
 
-    const acctPositions = positionsByAccount.get(accountId) ?? []
-    const totalInitial = acctPositions.reduce((s, p) => s + p.initialAmount, 0)
-    const totalCurrent = acctPositions.reduce((s, p) => s + p.currentValue, 0)
-    const earliestStart = acctPositions.length > 0
-      ? acctPositions.reduce((min, p) => p.startDate < min ? p.startDate : min, acctPositions[0].startDate)
-      : null
-    const annReturn = earliestStart && totalInitial > 0
-      ? annualizedReturn(totalCurrent, totalInitial, earliestStart)
-      : null
+    // ── Account (source) node ──────────────────────────────────────
+    const acctKey = mode === "yearly" ? `acct:${pos.accountId}:${year}` : `acct:${pos.accountId}`
+    const acctDisplayName = mode === "yearly" ? `${account.name} · ${year}` : account.name
 
-    const depth = (mode === "yearly" && year != null) ? yearToDepth.get(year) : undefined
+    if (!nodeByKey.has(acctKey)) {
+      // Aggregate all positions under this account for this year (or all years in flat mode)
+      const relPos = filtered.filter((p) => {
+        if (p.accountId !== pos.accountId) return false
+        if (mode === "yearly") return parseInt(p.startDate.slice(0, 4), 10) === year
+        return true
+      })
+      const totalInit = relPos.reduce((s, p) => s + p.initialAmount, 0)
+      const totalCurr = relPos.reduce((s, p) => s + p.currentValue, 0)
+      const earliest = relPos.reduce(
+        (min, p) => (p.startDate < min ? p.startDate : min),
+        relPos[0].startDate
+      )
+      nodeByKey.set(acctKey, {
+        name: acctDisplayName,
+        depth: yearIdx * 2,
+        itemStyle: { color: account.color },
+        _accountId: account.id,
+        _accountType: ACCOUNT_TYPE_LABELS[account.type] ?? account.type,
+        _totalInvested: totalInit,
+        _currentValue: totalCurr,
+        _startDate: earliest,
+        _holdingDuration: formatDateRange(earliest),
+        _annualizedReturn: totalInit > 0 ? annualizedReturn(totalCurr, totalInit, earliest) : null,
+        _positions: relPos.map((p) => ({
+          name: p.name,
+          initialAmount: p.initialAmount,
+          currentValue: p.currentValue,
+          startDate: p.startDate,
+        })),
+      })
+    }
 
-    nodeByKey.set(key, {
-      name: nodeName(account, year),
-      depth,
-      itemStyle: { color: account.color },
-      _accountId: accountId,
-      _accountType: ACCOUNT_TYPE_LABELS[account.type] ?? account.type,
-      _totalInvested: totalInitial,
-      _currentValue: totalCurrent,
-      _startDate: earliestStart,
-      _holdingDuration: earliestStart ? formatDateRange(earliestStart) : null,
-      _annualizedReturn: annReturn,
-      _positions: acctPositions.map((p) => ({
-        name: p.name,
-        initialAmount: p.initialAmount,
-        currentValue: p.currentValue,
-        startDate: p.startDate,
-      })),
-    })
-  }
+    // ── Investment (target) node ───────────────────────────────────
+    // Key includes accountId so same-named fund under different accounts stays separate
+    const posKey = mode === "yearly"
+      ? `pos:${pos.name}:${pos.accountId}:${year}`
+      : `pos:${pos.name}:${pos.accountId}`
+    const posDisplayName = mode === "yearly" ? `${pos.name} · ${year}` : pos.name
 
-  // Build links — aggregate same source+target pairs
-  const linkMap = new Map<string, { total: number; dates: string[]; notes: string[] }>()
-  for (const t of filtered) {
-    const from = accountMap.get(t.fromAccountId)
-    const to = accountMap.get(t.toAccountId)
-    if (!from || !to) continue
-    const year = mode === "yearly" ? parseInt(t.date.slice(0, 4), 10) : undefined
-    const srcName = nodeName(from, year)
-    const tgtName = nodeName(to, year)
-    const linkKey = `${srcName}→${tgtName}`
-    const existing = linkMap.get(linkKey) ?? { total: 0, dates: [], notes: [] }
-    existing.total += t.amount
-    existing.dates.push(t.date)
-    if (t.note) existing.notes.push(t.note)
+    if (!nodeByKey.has(posKey)) {
+      nodeByKey.set(posKey, {
+        name: posDisplayName,
+        depth: yearIdx * 2 + 1,
+        itemStyle: { color: lightenHex(account.color) },
+        _accountId: account.id,
+        _accountType: "投资持仓",
+        _totalInvested: pos.initialAmount,
+        _currentValue: pos.currentValue,
+        _startDate: pos.startDate,
+        _holdingDuration: formatDateRange(pos.startDate),
+        _annualizedReturn:
+          pos.initialAmount > 0
+            ? annualizedReturn(pos.currentValue, pos.initialAmount, pos.startDate)
+            : null,
+        _positions: [
+          {
+            name: pos.name,
+            initialAmount: pos.initialAmount,
+            currentValue: pos.currentValue,
+            startDate: pos.startDate,
+          },
+        ],
+      })
+    } else {
+      // Aggregate if same position name / account / year appears multiple times
+      const node = nodeByKey.get(posKey)!
+      node._totalInvested += pos.initialAmount
+      node._currentValue += pos.currentValue
+      node._positions.push({
+        name: pos.name,
+        initialAmount: pos.initialAmount,
+        currentValue: pos.currentValue,
+        startDate: pos.startDate,
+      })
+      node._annualizedReturn =
+        node._totalInvested > 0
+          ? annualizedReturn(node._currentValue, node._totalInvested, node._startDate ?? pos.startDate)
+          : null
+    }
+
+    // ── Link: account → investment ─────────────────────────────────
+    const linkKey = `${acctDisplayName}→${posDisplayName}`
+    const existing = linkMap.get(linkKey) ?? { total: 0, dates: [] }
+    existing.total += pos.initialAmount
+    existing.dates.push(pos.startDate)
     linkMap.set(linkKey, existing)
   }
 
   const links: SankeyLink[] = []
-  for (const [key, { total, dates, notes }] of linkMap.entries()) {
+  for (const [key, { total, dates }] of linkMap.entries()) {
     const [source, target] = key.split("→")
     dates.sort()
     links.push({
@@ -155,7 +202,7 @@ export function buildSankeyData(
       target,
       value: total,
       _date: dates.length === 1 ? dates[0] : `${dates[0]} ~ ${dates[dates.length - 1]}`,
-      _note: notes.length > 0 ? notes.join("、") : null,
+      _note: null,
       _transactionCount: dates.length,
     })
   }
@@ -164,6 +211,8 @@ export function buildSankeyData(
     nodes: Array.from(nodeByKey.values()),
     links,
     yearColumns: mode === "yearly" ? yearColumns : [],
+    yearLabelDepths: mode === "yearly" ? yearLabelDepths : [],
+    totalDepths,
   }
 }
 
@@ -172,45 +221,59 @@ export function tooltipHtml(params: {
   data: Record<string, unknown>
 }): string {
   const d = params.data
+  const displayName = (d.name as string).replace(/ · \d{4}$/, "")
 
   if (params.dataType === "node") {
-    const node = d as unknown as SankeyNode
-    const invested = node._totalInvested
-    const current = node._currentValue
-    const rate = node._annualizedReturn
-    // Strip " · YYYY" suffix for cleaner tooltip title
-    const displayName = (node.name as string).replace(/ · \d{4}$/, "")
+    const isPosition = d._accountType === "投资持仓"
+    const invested = d._totalInvested as number
+    const current = d._currentValue as number
+    const rate = d._annualizedReturn as number | null
 
-    let html = `<div class="sankey-tooltip">
-      <strong>${displayName}</strong>
-      <div class="row"><span>账户类型</span><span>${node._accountType}</span></div>`
-
-    if (node._positions.length > 0) {
-      html += `<div class="row"><span>持仓数量</span><span>${node._positions.length} 个</span></div>`
-      if (invested > 0) {
-        html += `<div class="row"><span>累计投入</span><span>${formatCNY(invested)}</span></div>`
-        html += `<div class="row"><span>当前市值</span><span>${formatCNY(current)}</span></div>`
-      }
-      if (node._holdingDuration) {
-        html += `<div class="row"><span>持有时长</span><span>${node._holdingDuration}</span></div>`
+    if (isPosition) {
+      const gain = current - invested
+      const gainSign = gain >= 0 ? "+" : ""
+      let html = `<div class="sankey-tooltip">
+        <strong>${displayName}</strong>
+        <div class="row"><span>买入金额</span><span>${formatCNY(invested)}</span></div>
+        <div class="row"><span>当前市值</span><span>${formatCNY(current)}</span></div>
+        <div class="row"><span>盈亏</span><span class="${gain >= 0 ? "positive" : "negative"}">${gainSign}${formatCNY(gain)}</span></div>`
+      if (d._holdingDuration) {
+        html += `<div class="row"><span>持有时长</span><span>${d._holdingDuration as string}</span></div>`
       }
       if (rate !== null) {
-        const cls = rate >= 0 ? "positive" : "negative"
-        html += `<div class="row"><span>年化收益</span><span class="${cls}">${formatPercent(rate)}</span></div>`
+        html += `<div class="row"><span>年化收益</span><span class="${rate >= 0 ? "positive" : "negative"}">${formatPercent(rate)}</span></div>`
       }
+      html += `</div>`
+      return html
+    }
+
+    // Account node
+    const posCount = (d._positions as unknown[])?.length ?? 0
+    let html = `<div class="sankey-tooltip">
+      <strong>${displayName}</strong>
+      <div class="row"><span>账户类型</span><span>${d._accountType as string}</span></div>
+      <div class="row"><span>持仓数量</span><span>${posCount} 个</span></div>`
+    if (invested > 0) {
+      html += `<div class="row"><span>累计投入</span><span>${formatCNY(invested)}</span></div>`
+      html += `<div class="row"><span>当前市值</span><span>${formatCNY(current)}</span></div>`
+    }
+    if (d._holdingDuration) {
+      html += `<div class="row"><span>最早持有</span><span>${d._holdingDuration as string}</span></div>`
+    }
+    if (rate !== null) {
+      html += `<div class="row"><span>年化收益</span><span class="${rate >= 0 ? "positive" : "negative"}">${formatPercent(rate)}</span></div>`
     }
     html += `</div>`
     return html
   }
 
-  const link = d as unknown as SankeyLink
-  const srcDisplay = (link.source as string).replace(/ · \d{4}$/, "")
-  const tgtDisplay = (link.target as string).replace(/ · \d{4}$/, "")
+  // Link tooltip
+  const srcDisplay = (d.source as string).replace(/ · \d{4}$/, "")
+  const tgtDisplay = (d.target as string).replace(/ · \d{4}$/, "")
   return `<div class="sankey-tooltip">
     <strong>${srcDisplay} → ${tgtDisplay}</strong>
-    <div class="row"><span>金额</span><span>${formatCNY(link.value as number)}</span></div>
-    <div class="row"><span>时间</span><span>${link._date}</span></div>
-    ${(link._transactionCount as number) > 1 ? `<div class="row"><span>笔数</span><span>${link._transactionCount as number} 笔</span></div>` : ""}
-    ${link._note ? `<div class="row"><span>备注</span><span>${link._note as string}</span></div>` : ""}
+    <div class="row"><span>投入金额</span><span>${formatCNY(d.value as number)}</span></div>
+    <div class="row"><span>买入日期</span><span>${d._date as string}</span></div>
+    ${(d._transactionCount as number) > 1 ? `<div class="row"><span>笔数</span><span>${d._transactionCount as number} 笔</span></div>` : ""}
   </div>`
 }

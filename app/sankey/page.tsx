@@ -9,6 +9,8 @@ interface SankeyData {
   nodes: unknown[]
   links: unknown[]
   yearColumns: number[]
+  yearLabelDepths: number[]
+  totalDepths: number
 }
 
 const SankeyChart = dynamic(() => import("@/components/sankey/SankeyChart"), { ssr: false })
@@ -18,9 +20,9 @@ const fetcher = (url: string) => fetch(url).then((r) => r.json())
 const CURRENT_YEAR = new Date().getFullYear()
 const MIN_YEAR = 2015
 
-// ECharts Sankey default margins (percentages of chart area)
-const SANKEY_LEFT = 5   // %
-const SANKEY_RIGHT = 21 // % (20% right margin for node labels)
+// ECharts Sankey default margins as % of chart width
+const SANKEY_LEFT_PCT = 5
+const SANKEY_RIGHT_PCT = 21  // right margin for node labels
 
 export default function SankeyPage() {
   const [mode, setMode] = useState<"flat" | "yearly">("yearly")
@@ -37,7 +39,16 @@ export default function SankeyPage() {
 
   const years = Array.from({ length: CURRENT_YEAR - MIN_YEAR + 1 }, (_, i) => MIN_YEAR + i)
   const yearColumns = data?.yearColumns ?? []
-  const showTimeAxis = mode === "yearly" && yearColumns.length > 1
+  const yearLabelDepths = data?.yearLabelDepths ?? []
+  const totalDepths = data?.totalDepths ?? 1
+  const showTimeAxis = mode === "yearly" && yearColumns.length > 0
+
+  // Convert a depth index to % position within the sankey area (0–100 within the area)
+  // then map to absolute % of chart width
+  function depthToLeftPct(depth: number): number {
+    const areaPct = totalDepths <= 1 ? 0 : (depth / (totalDepths - 1)) * 100
+    return SANKEY_LEFT_PCT + (areaPct * (100 - SANKEY_LEFT_PCT - SANKEY_RIGHT_PCT)) / 100
+  }
 
   return (
     <div className="flex flex-col h-full">
@@ -89,38 +100,31 @@ export default function SankeyPage() {
 
         {data && (
           <span className="text-xs text-muted-foreground ml-auto">
-            {data.nodes.length} 个账户节点 · {data.links.length} 条资金流
+            {data.nodes.length} 个节点 · {data.links.length} 条流向
           </span>
         )}
       </div>
 
       {/* Chart area */}
       <div className="flex-1 flex flex-col px-6 pt-3 pb-6 min-h-0">
-        {/* Time axis — positioned to match ECharts Sankey column centers */}
+        {/* Time axis — each year label positioned at its account column */}
         {showTimeAxis && (
           <div className="relative h-6 shrink-0 mb-1">
-            <div
-              className="absolute inset-0"
-              style={{ left: `${SANKEY_LEFT}%`, right: `${SANKEY_RIGHT}%` }}
-            >
-              {yearColumns.map((year, i) => {
-                const pct = yearColumns.length === 1
-                  ? 0
-                  : (i / (yearColumns.length - 1)) * 100
-                return (
-                  <div
-                    key={year}
-                    className="absolute flex flex-col items-center"
-                    style={{ left: `${pct}%`, transform: "translateX(-50%)" }}
-                  >
-                    <span className="text-xs font-semibold text-foreground/70 leading-none">
-                      {year}
-                    </span>
-                    <span className="w-px h-2 bg-border mt-0.5" />
-                  </div>
-                )
-              })}
-            </div>
+            {yearColumns.map((year, i) => {
+              const leftPct = depthToLeftPct(yearLabelDepths[i] ?? i * 2)
+              return (
+                <div
+                  key={year}
+                  className="absolute flex flex-col items-center"
+                  style={{ left: `${leftPct}%`, transform: "translateX(-50%)" }}
+                >
+                  <span className="text-xs font-semibold text-foreground/70 leading-none whitespace-nowrap">
+                    {year}
+                  </span>
+                  <span className="w-px h-2 bg-border mt-0.5" />
+                </div>
+              )
+            })}
           </div>
         )}
 
